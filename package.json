@@ -1,0 +1,12 @@
+{
+  "name": "swiftchat-relay-server",
+  "version": "1.0.0",
+  "description": "Zero-Storage Realtime WebSocket Relay for SwiftChat 2-Device iOS Chat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
