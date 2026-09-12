@@ -5,8 +5,9 @@
  * - 100% In-Memory (Zero-Storage): Không có cơ sở dữ liệu, không ghi ổ đĩa.
  * - Giới hạn tối đa 2 thiết bị trong mỗi phòng (Slot 1 & Slot 2).
  * - Heartbeat Ping/Pong 15s chống Cloudflare/4G idle timeout.
- * - Tự động đồng bộ và thay thế socket khi điện thoại reconnect.
- * - Tự động dọn phòng khi cả 2 máy ngắt kết nối.
+ * - Hộp thư tin nhắn mã hoá bất đồng bộ (E2EE Dead-Drop Mailbox).
+ * - Cơ chế Xoá 2 Chiều (Delete for Everyone & Clear History) chuẩn Telegram.
+ * - Tự động dọn dẹp tin nhắn quá 24h.
  */
 
 const http = require('http');
@@ -17,13 +18,31 @@ const PORT = process.env.PORT || 8080;
 // Tạo HTTP Server phục vụ Health-Check cho Cloud (Render, Fly.io, Koyeb, Railway)
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('BRAVO KEY Relay Server is running.\nStatus: 200 OK\nMode: Zero-Storage RAM-Only\nHeartbeat: 15s\n');
+    res.end('BRAVO KEY Relay Server is running.\nStatus: 200 OK\nMode: Zero-Storage RAM-Only\nHeartbeat: 15s\nMailbox: E2EE Dead-Drop\n');
 });
 
 const wss = new WebSocketServer({ server });
 
 // Lưu trạng thái phòng trong RAM: roomCode -> Map of senderId -> { ws, senderName }
 const rooms = new Map();
+
+// Hộp thư tin nhắn mã hoá bất đồng bộ theo phòng (E2EE Dead-Drop Mailbox)
+// roomCode -> Array of { messageId, senderId, senderName, payload, timestamp }
+const roomMailboxes = new Map();
+
+// Tự động dọn dẹp các tin nhắn quá 24h trong Hộp thư mỗi 15 phút
+const PURGE_TTL_SECONDS = 24 * 3600;
+setInterval(() => {
+    const nowSec = Date.now() / 1000;
+    for (const [rCode, mList] of roomMailboxes.entries()) {
+        const validMessages = mList.filter(m => (nowSec - m.timestamp) < PURGE_TTL_SECONDS);
+        if (validMessages.length === 0) {
+            roomMailboxes.delete(rCode);
+        } else {
+            roomMailboxes.set(rCode, validMessages);
+        }
+    }
+}, 15 * 60 * 1000);
 
 // Helper: Dọn dẹp các socket chết / đã đóng khỏi phòng
 function pruneRoom(roomCode) {
@@ -37,7 +56,7 @@ function pruneRoom(roomCode) {
     }
     if (participants.size === 0) {
         rooms.delete(roomCode);
-        console.log(`[x] Phòng rỗng "${roomCode}" đã xóa sạch khỏi RAM.`);
+        console.log(`[x] Phòng rỗng "${roomCode}" đã giải phóng socket.`);
     }
 }
 
@@ -95,7 +114,7 @@ wss.on('connection', (ws) => {
     ws.on('message', (data) => {
         try {
             const event = JSON.parse(data.toString());
-            const { action, room, senderId, senderName, payload, timestamp } = event;
+            const { action, room, senderId, senderName, messageId, payload, timestamp } = event;
 
             if (action === 'join') {
                 currentRoom = room;
@@ -137,6 +156,22 @@ wss.on('connection', (ws) => {
                 roomParticipants.set(senderId, { ws, senderName });
                 console.log(`[+] Thiết bị "${senderName}" (${senderId}) vào phòng: ${room}. Số lượng: ${roomParticipants.size}/2`);
 
+                // ĐỒNG BỘ LỊCH SỬ TIN NHẮN TỪ HỘP THƯ CHO THIẾT BỊ MỚI VÀO
+                if (roomMailboxes.has(room)) {
+                    const mailbox = roomMailboxes.get(room);
+                    if (mailbox && mailbox.length > 0) {
+                        ws.send(JSON.stringify({
+                            action: 'history_sync',
+                            room: room,
+                            senderId: 'system',
+                            senderName: 'Hệ thống',
+                            payload: JSON.stringify(mailbox),
+                            timestamp: Date.now() / 1000
+                        }));
+                        console.log(`[sync] Đã gửi ${mailbox.length} tin nhắn lịch sử cho "${senderName}"`);
+                    }
+                }
+
                 // Nếu đã đủ 2 máy, lập tức đồng bộ peer_joined cho cả 2
                 if (roomParticipants.size === 2) {
                     broadcastPeerJoined(room);
@@ -144,7 +179,70 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // Chuyển tiếp tin nhắn / sự kiện (message, typing, image) tới máy còn lại
+            // XỬ LÝ LỆNH XOÁ TỪNG TIN NHẮN 2 CHIỀU (Delete for Everyone)
+            if (action === 'delete_message') {
+                const targetId = messageId || payload;
+                if (currentRoom && roomMailboxes.has(currentRoom)) {
+                    const mailbox = roomMailboxes.get(currentRoom);
+                    const filtered = mailbox.filter(m => m.messageId !== targetId);
+                    roomMailboxes.set(currentRoom, filtered);
+                    console.log(`[delete_msg] Đã xoá tin (${targetId}) khỏi hộp thư phòng: ${currentRoom}`);
+                }
+                // Chuyển tiếp lệnh xoá tới máy đối phương
+                if (currentRoom && rooms.has(currentRoom)) {
+                    const roomParticipants = rooms.get(currentRoom);
+                    for (const [pId, pData] of roomParticipants.entries()) {
+                        if (pId !== senderId && pData.ws.readyState === WebSocket.OPEN) {
+                            pData.ws.send(JSON.stringify(event));
+                        }
+                    }
+                }
+                return;
+            }
+
+            // XỬ LÝ LỆNH XOÁ TOÀN BỘ LỊCH SỬ 2 CHIỀU (Clear History for Both)
+            if (action === 'clear_room_history') {
+                if (currentRoom && roomMailboxes.has(currentRoom)) {
+                    roomMailboxes.delete(currentRoom);
+                    console.log(`[clear_history] Đã tiêu huỷ toàn bộ hộp thư phòng: ${currentRoom}`);
+                }
+                // Chuyển tiếp lệnh xoá tới máy đối phương
+                if (currentRoom && rooms.has(currentRoom)) {
+                    const roomParticipants = rooms.get(currentRoom);
+                    for (const [pId, pData] of roomParticipants.entries()) {
+                        if (pId !== senderId && pData.ws.readyState === WebSocket.OPEN) {
+                            pData.ws.send(JSON.stringify(event));
+                        }
+                    }
+                }
+                return;
+            }
+
+            // XỬ LÝ GỬI TIN NHẮN (action === 'message')
+            if (action === 'message') {
+                // Lưu vào Hộp thư phòng (E2EE Dead-Drop Mailbox)
+                const targetRoom = room || currentRoom;
+                if (targetRoom) {
+                    if (!roomMailboxes.has(targetRoom)) {
+                        roomMailboxes.set(targetRoom, []);
+                    }
+                    const mailbox = roomMailboxes.get(targetRoom);
+                    const msgId = messageId || (Date.now() + '-' + Math.random().toString(36).substr(2, 9));
+                    mailbox.push({
+                        messageId: msgId,
+                        senderId,
+                        senderName,
+                        payload,
+                        timestamp: timestamp || (Date.now() / 1000)
+                    });
+                    // Giới hạn tối đa 50 tin gần nhất
+                    if (mailbox.length > 50) {
+                        mailbox.shift();
+                    }
+                }
+            }
+
+            // Chuyển tiếp tin nhắn / sự kiện (message, typing, image) tới máy còn lại nếu đang online
             if (currentRoom && rooms.has(currentRoom)) {
                 const roomParticipants = rooms.get(currentRoom);
                 for (const [pId, pData] of roomParticipants.entries()) {
