@@ -5,9 +5,8 @@
  * - 100% In-Memory (Zero-Storage): Không có cơ sở dữ liệu, không ghi ổ đĩa.
  * - Giới hạn tối đa 2 thiết bị trong mỗi phòng (Slot 1 & Slot 2).
  * - Heartbeat Ping/Pong 15s chống Cloudflare/4G idle timeout.
- * - Hộp thư tin nhắn mã hoá bất đồng bộ (E2EE Dead-Drop Mailbox).
- * - Cơ chế Xoá 2 Chiều (Delete for Everyone & Clear History) chuẩn Telegram.
- * - Tự động dọn dẹp tin nhắn quá 24h.
+ * - Tự động đồng bộ và thay thế socket khi điện thoại reconnect.
+ * - Tự động dọn phòng khi cả 2 máy ngắt kết nối.
  */
 
 const http = require('http');
@@ -30,7 +29,15 @@ const rooms = new Map();
 // roomCode -> Array of { messageId, senderId, senderName, payload, timestamp }
 const roomMailboxes = new Map();
 
-// Tự động dọn dẹp các tin nhắn quá 24h trong Hộp thư mỗi 15 phút
+// Danh sách tin nhắn đã bị xoá 2 chiều theo phòng (Tombstones để đồng bộ cho thiết bị offline)
+// roomCode -> Set of messageId
+const roomDeletedMessageIds = new Map();
+
+// Mốc thời gian xoá sạch toàn bộ phòng gần nhất (cho Clear History for Everyone khi đối phương offline)
+// roomCode -> timestamp (seconds)
+const roomClearedTimestamps = new Map();
+
+// Tự động dọn dẹp các tin nhắn và tombstone quá 24h trong Hộp thư mỗi 15 phút
 const PURGE_TTL_SECONDS = 24 * 3600;
 setInterval(() => {
     const nowSec = Date.now() / 1000;
@@ -40,6 +47,11 @@ setInterval(() => {
             roomMailboxes.delete(rCode);
         } else {
             roomMailboxes.set(rCode, validMessages);
+        }
+    }
+    for (const [rCode, clearTime] of roomClearedTimestamps.entries()) {
+        if ((nowSec - clearTime) > PURGE_TTL_SECONDS) {
+            roomClearedTimestamps.delete(rCode);
         }
     }
 }, 15 * 60 * 1000);
@@ -156,20 +168,25 @@ wss.on('connection', (ws) => {
                 roomParticipants.set(senderId, { ws, senderName });
                 console.log(`[+] Thiết bị "${senderName}" (${senderId}) vào phòng: ${room}. Số lượng: ${roomParticipants.size}/2`);
 
-                // ĐỒNG BỘ LỊCH SỬ TIN NHẮN TỪ HỘP THƯ CHO THIẾT BỊ MỚI VÀO
-                if (roomMailboxes.has(room)) {
-                    const mailbox = roomMailboxes.get(room);
-                    if (mailbox && mailbox.length > 0) {
-                        ws.send(JSON.stringify({
-                            action: 'history_sync',
-                            room: room,
-                            senderId: 'system',
-                            senderName: 'Hệ thống',
-                            payload: JSON.stringify(mailbox),
-                            timestamp: Date.now() / 1000
-                        }));
-                        console.log(`[sync] Đã gửi ${mailbox.length} tin nhắn lịch sử cho "${senderName}"`);
-                    }
+                // ĐỒNG BỘ LỊCH SỬ TIN NHẮN TỪ HỘP THƯ VÀ LỆNH XOÁ CHO THIẾT BỊ MỚI VÀO (Offline Sync)
+                const mailbox = roomMailboxes.get(room) || [];
+                const deletedIds = roomDeletedMessageIds.has(room) ? Array.from(roomDeletedMessageIds.get(room)) : [];
+                const clearedAt = roomClearedTimestamps.get(room) || 0;
+
+                if (mailbox.length > 0 || deletedIds.length > 0 || clearedAt > 0) {
+                    ws.send(JSON.stringify({
+                        action: 'history_sync',
+                        room: room,
+                        senderId: 'system',
+                        senderName: 'Hệ thống',
+                        payload: JSON.stringify({
+                            messages: mailbox,
+                            deletedMessageIds: deletedIds,
+                            clearedAt: clearedAt
+                        }),
+                        timestamp: Date.now() / 1000
+                    }));
+                    console.log(`[sync] Đã gửi đồng bộ cho "${senderName}" (${room}): ${mailbox.length} tin, ${deletedIds.length} tin đã xoá, clearedAt=${clearedAt}`);
                 }
 
                 // Nếu đã đủ 2 máy, lập tức đồng bộ peer_joined cho cả 2
@@ -182,15 +199,24 @@ wss.on('connection', (ws) => {
             // XỬ LÝ LỆNH XOÁ TỪNG TIN NHẮN 2 CHIỀU (Delete for Everyone)
             if (action === 'delete_message') {
                 const targetId = messageId || payload;
-                if (currentRoom && roomMailboxes.has(currentRoom)) {
-                    const mailbox = roomMailboxes.get(currentRoom);
-                    const filtered = mailbox.filter(m => m.messageId !== targetId);
-                    roomMailboxes.set(currentRoom, filtered);
-                    console.log(`[delete_msg] Đã xoá tin (${targetId}) khỏi hộp thư phòng: ${currentRoom}`);
+                const targetRoom = room || currentRoom;
+                if (targetRoom && targetId) {
+                    // 1. Xoá khỏi Hộp thư RAM nếu còn tồn tại
+                    if (roomMailboxes.has(targetRoom)) {
+                        const mailbox = roomMailboxes.get(targetRoom);
+                        const filtered = mailbox.filter(m => m.messageId !== targetId);
+                        roomMailboxes.set(targetRoom, filtered);
+                    }
+                    // 2. Ghi nhận vào danh sách Tombstones để đồng bộ cho máy offline khi họ vào sau
+                    if (!roomDeletedMessageIds.has(targetRoom)) {
+                        roomDeletedMessageIds.set(targetRoom, new Set());
+                    }
+                    roomDeletedMessageIds.get(targetRoom).add(targetId);
+                    console.log(`[delete_msg] Đã xoá tin (${targetId}) và lưu tombstone phòng: ${targetRoom}`);
                 }
-                // Chuyển tiếp lệnh xoá tới máy đối phương
-                if (currentRoom && rooms.has(currentRoom)) {
-                    const roomParticipants = rooms.get(currentRoom);
+                // Chuyển tiếp lệnh xoá tới máy đối phương nếu đang online
+                if (targetRoom && rooms.has(targetRoom)) {
+                    const roomParticipants = rooms.get(targetRoom);
                     for (const [pId, pData] of roomParticipants.entries()) {
                         if (pId !== senderId && pData.ws.readyState === WebSocket.OPEN) {
                             pData.ws.send(JSON.stringify(event));
@@ -202,13 +228,19 @@ wss.on('connection', (ws) => {
 
             // XỬ LÝ LỆNH XOÁ TOÀN BỘ LỊCH SỬ 2 CHIỀU (Clear History for Both)
             if (action === 'clear_room_history') {
-                if (currentRoom && roomMailboxes.has(currentRoom)) {
-                    roomMailboxes.delete(currentRoom);
-                    console.log(`[clear_history] Đã tiêu huỷ toàn bộ hộp thư phòng: ${currentRoom}`);
+                const targetRoom = room || currentRoom;
+                if (targetRoom) {
+                    // 1. Tiêu huỷ toàn bộ hộp thư phòng
+                    roomMailboxes.delete(targetRoom);
+                    // 2. Ghi nhận mốc thời gian xoá sạch phòng để đồng bộ xoá sạch trên máy offline khi họ vào sau
+                    const clearTime = Date.now() / 1000;
+                    roomClearedTimestamps.set(targetRoom, clearTime);
+                    roomDeletedMessageIds.delete(targetRoom);
+                    console.log(`[clear_history] Đã tiêu huỷ toàn bộ hộp thư phòng: ${targetRoom} (clearedAt=${clearTime})`);
                 }
-                // Chuyển tiếp lệnh xoá tới máy đối phương
-                if (currentRoom && rooms.has(currentRoom)) {
-                    const roomParticipants = rooms.get(currentRoom);
+                // Chuyển tiếp lệnh xoá tới máy đối phương nếu đang online
+                if (targetRoom && rooms.has(targetRoom)) {
+                    const roomParticipants = rooms.get(targetRoom);
                     for (const [pId, pData] of roomParticipants.entries()) {
                         if (pId !== senderId && pData.ws.readyState === WebSocket.OPEN) {
                             pData.ws.send(JSON.stringify(event));
